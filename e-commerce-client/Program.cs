@@ -1,5 +1,4 @@
-﻿using ECommerceClient.Structs;
-using ECommerceClient.Structs.ProcVars;
+﻿using ECommerceClient.Structs.ProcVars;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.Logging;
 using Newtonsoft.Json;
@@ -16,14 +15,16 @@ public class Program {
     private static readonly List<IJobWorker> workers = [];
     private static readonly ILoggerFactory loggerFactory = new NLogLoggerFactory();
     private static readonly ILogger<Program> logger = loggerFactory.CreateLogger<Program>();
-    private static Random random = new();
+    private static readonly Random random = new();
 
     public static async Task Main(string[] args) {
+        // Retrieve Camunda user secrets
         IConfiguration config = new ConfigurationBuilder()
             .AddUserSecrets<Program>()
             .Build();
         var camundaConfig = config.GetRequiredSection("Camunda");
 
+        // Create a Camunda client
         client = CamundaCloudClientBuilder.Builder()
             .UseClientId(camundaConfig["ClientId"])
             .UseClientSecret(camundaConfig["ClientSecret"])
@@ -32,8 +33,8 @@ public class Program {
             .Build();
 
         using(client) {
-            var topology = await client.TopologyRequest().Send();
-            
+            // We assume that the process has been started remotely so no process initialization is done
+            // Register job workers and wait until the client is stopped by the user
             RegisterWorkers();
             while(Console.ReadKey(true).KeyChar != 'q') ;
             UnregisterWorkers();
@@ -41,6 +42,7 @@ public class Program {
     }
 
     private static void RegisterWorkers() {
+        // Job worker for order ID generation
         workers.Add(
             client!.NewWorker()
                 .JobType("GenerateOrder")
@@ -53,6 +55,7 @@ public class Program {
                 .Open()
         );
 
+        // Message throw job worker for when an order is placed
         workers.Add(MessageThrowJob<CustomerProcVariables>("PlaceOrder", "msgCustomerPlaceOrder",
             vars => vars.Order.Id!.ToString()!,
             sentVariables: JsonConvert.SerializeObject,
@@ -60,26 +63,32 @@ public class Program {
                 vars.Order.Item.Id, vars.Order.Item.VariantId, vars.Order.Item.Quantity
             )
         ));
+        // Message throw job worker for when a customer has paid for their order
         workers.Add(MessageThrowJob<CustomerProcVariables>("PayOrder", "msgCustomerPayOrder",
             vars => vars.Order.Id!.ToString()!,
             preCall: vars => logger.LogInformation("Payment for order ID: {OrderId}", vars.Order.Id)
         ));
+        // Message throw job worker for when an order is marked as complete by the customer
         workers.Add(MessageThrowJob<CustomerProcVariables>("OrderCompletion", "msgCustomerConfirmComplete",
             vars => vars.Order.Id!.ToString()!,
             preCall: vars => logger.LogInformation("Order completion confirmed for order ID: {OrderId}", vars.Order.Id)
         ));
+        // Message throw job worker for when a customer sends a request for package return
         workers.Add(MessageThrowJob<CustomerProcVariables>("ReturnRequest", "msgCustomerRequestReturn",
             vars => vars.Order.Id!.ToString()!,
             preCall: vars => logger.LogInformation("Return requested for order ID: {OrderId}", vars.Order.Id)
         ));
+        // Message throw job worker for when a returned package has been shipped by the customer
         workers.Add(MessageThrowJob<CustomerProcVariables>("ShipReturn", "msgCustomerShipReturn",
             vars => vars.Order.Id!.ToString()!,
             preCall: vars => logger.LogInformation("Sent back returned item for order ID: {OrderId}", vars.Order.Id)
         ));
+        // Message throw job worker for when an ordered package has been shipped by the seller
         workers.Add(MessageThrowJob<SellerProcVariables>("ShipOrder", "msgSellerShipOrder",
             vars => vars.Order.Id!.ToString()!,
             preCall: vars => logger.LogInformation("Sent shipment status for order ID: {OrderId}", vars.Order.Id)
         ));
+        // Message throw job worker for when a return request is approved or rejected by the seller
         workers.Add(MessageThrowJob<SellerProcVariables>("ReturnApproval", "msgSellerReturnApproval",
             vars => vars.Order.Id!.ToString()!,
             sentVariables: JsonConvert.SerializeObject,
@@ -101,6 +110,8 @@ public class Program {
             Action<T>? postCall = null
         )
         where T : IProcVars {
+        // Method for message publishing using a message name and correlation key
+        // preCall is invoked before the message is sent, then postCall is invoked after
         async Task publishMessageAction(IJob job) {
             var vars = JsonConvert.DeserializeObject<T>(job.Variables);
             var corrKey = correlationKey(vars);
@@ -117,6 +128,7 @@ public class Program {
             postCall?.Invoke(vars);
         }
 
+        // The actual job handler delegate method to be submitted to the client
         async Task jobHandler(IJobClient jobClient, IJob job) {
             await publishMessageAction(job).ContinueWith(async task => {
                 if(task.IsFaulted) {
